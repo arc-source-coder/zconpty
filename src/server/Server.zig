@@ -137,7 +137,7 @@ pub fn stop(session: *Session) void {
     }
 
     if (handleIsValid(session.child_process)) {
-        _ = windows.NtTerminateProcess(session.child_process, @enumFromInt(0));
+        _ = windows.NtTerminateProcess(session.child_process, .SUCCESS);
         _ = windows.NtClose(session.child_process);
         session.child_process = windows.INVALID_HANDLE_VALUE;
     }

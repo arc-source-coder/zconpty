@@ -1,5 +1,20 @@
 const std = @import("std");
 
+fn addUucodeImport(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    if (b.lazyDependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .build_config_path = b.path("src/build/uucode_config.zig"),
+    })) |dep| {
+        module.addImport("uucode", dep.module("uucode"));
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = blk: {
         var result = b.standardTargetOptions(.{});
@@ -18,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    addUucodeImport(b, module, target, optimize);
 
     const test_step = b.step("test", "Run unit tests");
     const lib_tests = b.addTest(.{
@@ -27,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    addUucodeImport(b, lib_tests.root_module, target, optimize);
     lib_tests.root_module.addImport("zconpty", module);
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 

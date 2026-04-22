@@ -80,6 +80,8 @@ pub const ApiHandler = struct {
             };
         }
 
+        self.input.redrawCookedAfterHostOutput();
+
         write_message.NumBytes = @intCast(payload.len);
         ioCompletion.setSuccessWithInformation(completion, payload.len);
         return .complete;
@@ -129,8 +131,8 @@ pub const ApiHandler = struct {
         return switch (self.input.beginGetConsoleInput(message, completion)) {
             .completed => .complete,
             .pending => .pending,
-            .unsupported => blk: {
-                ioCompletion.setStatus(completion, .NOT_IMPLEMENTED);
+            .failed => |status| blk: {
+                ioCompletion.setStatus(completion, status);
                 break :blk .complete;
             },
         };
@@ -176,8 +178,8 @@ pub const ApiHandler = struct {
         return switch (self.input.beginReadConsole(message, completion)) {
             .completed => .complete,
             .pending => .pending,
-            .unsupported => blk: {
-                ioCompletion.setStatus(completion, .NOT_IMPLEMENTED);
+            .failed => |status| blk: {
+                ioCompletion.setStatus(completion, status);
                 break :blk .complete;
             },
         };
@@ -415,6 +417,31 @@ pub const ApiHandler = struct {
             return .complete;
         };
         self.feedVt(vt);
+        ioCompletion.setSuccess(completion);
+        return .complete;
+    }
+
+    pub fn handleScrollConsoleScreenBuffer(
+        self: *ApiHandler,
+        message: *CONSOLE_DATA_PACKET,
+        completion: *condrv.CD_IO_COMPLETE,
+    ) DispatchResult {
+        const handle = getHandle(message) orelse {
+            ioCompletion.setStatus(completion, .INVALID_HANDLE);
+            return .complete;
+        };
+
+        if (!hasRequiredAccess(handle, windows.GENERIC_WRITE)) {
+            ioCompletion.setStatus(completion, .ACCESS_DENIED);
+            return .complete;
+        }
+
+        const request = &message.Body.api_msg.msgBody.consoleMsgL2.ScrollConsoleScreenBuffer;
+        const enable_cmd_shim = isCmdClient(self, message);
+        if (scrollRequestClearsViewport(self, request, enable_cmd_shim)) {
+            self.feedVtClear();
+        }
+
         ioCompletion.setSuccess(completion);
         return .complete;
     }
@@ -1129,14 +1156,16 @@ pub const ApiHandler = struct {
         fill_kind: Terminal.FillKind,
         fill_cell: Terminal.Cell,
     ) windows.ULONG {
-        if (shouldFastPathPowershellClear(self, start, len, enable_powershell_shim, clear_kind)) {
-            if (clear_kind == .character_space) {
-                self.feedVt("\x1b[H\x1b[2J\x1b[3J");
-            }
+        if (enable_powershell_shim and isViewportClear(self, start, len, clear_kind)) {
+            if (clear_kind == .character_space) self.feedVtClear();
             return len;
         }
 
         return @intCast(self.state.terminal.fillSpan(start, len, fill_kind, fill_cell));
+    }
+
+    fn feedVtClear(self: *ApiHandler) void {
+        self.feedVt("\x1b[H\x1b[2J\x1b[3J");
     }
 
     fn getHandle(message: *const CONSOLE_DATA_PACKET) ?*Handle {
@@ -1208,14 +1237,12 @@ pub const ApiHandler = struct {
         default_attribute,
     };
 
-    fn shouldFastPathPowershellClear(
+    fn isViewportClear(
         self: *ApiHandler,
         start: Terminal.Point,
         len: windows.ULONG,
-        enable_powershell_shim: bool,
         clear_kind: FillClearKind,
     ) bool {
-        if (!enable_powershell_shim) return false;
         if (clear_kind == .none) return false;
         if (start.x != 0 or start.y != 0) return false;
 
@@ -1226,6 +1253,58 @@ pub const ApiHandler = struct {
         if (len != viewport_area) return false;
 
         return true;
+    }
+
+    fn scrollRequestClearsViewport(
+        self: *ApiHandler,
+        request: *const conMsg.L2.CONSOLE_SCROLLSCREENBUFFER_MSG,
+        enable_cmd_shim: bool,
+    ) bool {
+        if (!enable_cmd_shim) return false;
+        if (request.Clip != .FALSE) return false;
+        if (request.DestinationOrigin.X != 0) return false;
+
+        const scroll = request.ScrollRectangle;
+        if (scroll.Left != 0 or scroll.Top != 0) return false;
+
+        var cols: u16 = 0;
+        var rows: u16 = 0;
+        self.state.terminal.getSize(&cols, &rows);
+        if (cols == 0 or rows == 0) return false;
+
+        if (scroll.Right < cols - 1 or scroll.Bottom < rows - 1) return false;
+        if (request.DestinationOrigin.Y > -@as(windows.SHORT, @intCast(rows))) return false;
+
+        const fill_char, const fill_attributes = normalizedScrollFill(request, self.state.console.attributes.current.toWord());
+        if (fill_char != ' ') return false;
+        if (fill_attributes != self.state.console.attributes.current.toWord()) return false;
+
+        return true;
+    }
+
+    fn normalizedScrollFill(
+        request: *const conMsg.L2.CONSOLE_SCROLLSCREENBUFFER_MSG,
+        current_attributes: windows.WORD,
+    ) struct { windows.WCHAR, windows.WORD } {
+        var fill_char: windows.WCHAR = if (request.Unicode != .FALSE)
+            request.Fill.Char.UnicodeChar
+        else
+            request.Fill.Char.AsciiChar;
+        var fill_attributes = request.Fill.Attributes;
+
+        if (fill_char == 0 and fill_attributes == 0) {
+            fill_attributes = current_attributes;
+        }
+
+        if (fill_char == 0) {
+            fill_char = ' ';
+        }
+
+        return .{ fill_char, fill_attributes };
+    }
+
+    fn isCmdClient(self: *ApiHandler, message: *const CONSOLE_DATA_PACKET) bool {
+        return self.state.isCmdClient(message.Descriptor.Process);
     }
 
     fn writeFaceName(comptime text: []const u8, buffer: *[windows.LF_FACESIZE]windows.WCHAR) void {

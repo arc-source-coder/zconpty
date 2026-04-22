@@ -18,6 +18,7 @@ test {
     _ = @import("server/ApiMsg.zig");
     _ = @import("server/Condrv.zig");
     _ = @import("server/ConDrvHandler.zig");
+    _ = @import("server/CookedRead.zig");
     _ = @import("server/Dispatcher.zig");
     _ = @import("server/Input.zig");
     _ = @import("server/InputTypes.zig");

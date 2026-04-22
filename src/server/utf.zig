@@ -38,6 +38,16 @@ pub inline fn utf16LeToUtf8Alloc(
     return std.unicode.utf16LeToUtf8Alloc(allocator, text);
 }
 
+pub fn utf8ToUtf16BytesAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) ![]u8 {
+    const utf16 = try utf8ToUtf16LeAllocZ(allocator, text);
+    defer allocator.free(utf16);
+
+    return allocator.dupe(u8, std.mem.sliceAsBytes(utf16[0..utf16.len]));
+}
+
 pub fn encodeCodepointUtf8(codepoint: u21, out: []u8) !u3 {
     return std.unicode.utf8Encode(codepoint, out);
 }

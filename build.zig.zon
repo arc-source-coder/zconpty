@@ -9,5 +9,10 @@
         "src/server/",
         "src/utils.zig",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode#5dd92981eb5d9d65ae046201f4b4395569ed2790",
+            .hash = "uucode-0.2.0-ZZjBPui3VAC_VVwydn3Tbi0Z03zbn4J8o0-_2SZWkmAS",
+        },
+    },
 }

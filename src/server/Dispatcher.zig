@@ -506,7 +506,7 @@ pub fn handleDispatch(
         .set_screen_buffer_size => .complete,
         .set_cursor_position => handler.handleSetConsoleCursorPosition(message, completion),
         .get_largest_window_size => .complete,
-        .scroll_screen_buffer => .complete,
+        .scroll_screen_buffer => handler.handleScrollConsoleScreenBuffer(message, completion),
         .set_text_attribute => handler.handleSetConsoleTextAttribute(message, completion),
         .set_window_info => .complete,
         .read_console_output_string => .complete,

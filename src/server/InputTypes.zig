@@ -314,6 +314,57 @@ pub fn controlKeyStateFromMods(mods: Mods) windows.DWORD {
     return state;
 }
 
+pub fn effectiveControlKeyState(event: KeyEvent, include_enhanced_key: bool) windows.DWORD {
+    var state: windows.DWORD = if (event.has_win_control_key_state != 0)
+        event.win_control_key_state
+    else
+        controlKeyStateFromMods(event.mods);
+
+    if (include_enhanced_key and event.has_win_vk != 0 and shouldSetEnhancedFlag(event.win_vk)) {
+        state |= windows.ENHANCED_KEY;
+    }
+
+    return state;
+}
+
+pub fn isCtrlC(event: KeyEvent, control_key_state: windows.DWORD) bool {
+    const ctrl_pressed = (control_key_state &
+        (windows.LEFT_CTRL_PRESSED | windows.RIGHT_CTRL_PRESSED)) != 0;
+    const alt_pressed = (control_key_state &
+        (windows.LEFT_ALT_PRESSED | windows.RIGHT_ALT_PRESSED)) != 0;
+    if (!ctrl_pressed or alt_pressed) return false;
+    return event.code == .key_c;
+}
+
+pub fn shouldUseCtrlBackspaceWordErase(control_key_state: windows.DWORD) bool {
+    const ctrl_pressed = (control_key_state &
+        (windows.LEFT_CTRL_PRESSED | windows.RIGHT_CTRL_PRESSED)) != 0;
+    const alt_pressed = (control_key_state &
+        (windows.LEFT_ALT_PRESSED | windows.RIGHT_ALT_PRESSED)) != 0;
+    const shift_pressed = (control_key_state & windows.SHIFT_PRESSED) != 0;
+    // OpenConsole treats Ctrl+Backspace as word erase (DEL / 0x7F) for
+    // cooked read, but does not apply that behavior when Shift is also held.
+    return ctrl_pressed and !alt_pressed and !shift_pressed;
+}
+
+fn shouldSetEnhancedFlag(win_vk: u16) bool {
+    return switch (win_vk) {
+        0x21, // VK_PRIOR (Page Up)
+        0x22, // VK_NEXT  (Page Down)
+        0x23, // VK_END
+        0x24, // VK_HOME
+        0x25, // VK_LEFT
+        0x26, // VK_UP
+        0x27, // VK_RIGHT
+        0x28, // VK_DOWN
+        0x2D, // VK_INSERT
+        0x2E, // VK_DELETE
+        0x6F, // VK_DIVIDE (numpad)
+        => true,
+        else => false,
+    };
+}
+
 test "W3CCode.fromW3C resolves supported names" {
     // Letters
     try std.testing.expectEqual(W3CCode.key_a, W3CCode.fromW3C("KeyA").?);

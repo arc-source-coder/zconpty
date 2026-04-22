@@ -105,6 +105,12 @@ pub const ConsoleAttributes = struct {
     popup: TextAttributes = TextAttributes.fromWord(windows.DEFAULT_POPUP_ATTRIBUTES),
 };
 
+pub const HistorySettings = struct {
+    history_buffer_size: u32 = 50,
+    number_of_history_buffers: u32 = 4,
+    history_no_dup: bool = false,
+};
+
 pub const InputMode = packed struct(u32) {
     enable_processed_input: bool = true,
     enable_line_input: bool = true,
@@ -152,6 +158,7 @@ pub const ConsoleState = struct {
     original_title: std.ArrayList(u8),
     cursor: CursorState,
     attributes: ConsoleAttributes,
+    history: HistorySettings,
 
     pub fn init() ConsoleState {
         return .{
@@ -162,6 +169,7 @@ pub const ConsoleState = struct {
             .original_title = .empty,
             .cursor = .{},
             .attributes = .{},
+            .history = .{},
         };
     }
 
@@ -256,6 +264,18 @@ pub const State = struct {
         for (self.processes.items) |entry| {
             if (client_process == @intFromPtr(entry)) {
                 return entry.shim_policy.is_powershell_exe;
+            }
+        }
+        return false;
+    }
+
+    pub fn isCmdClient(self: *State, client_process: windows.ULONG_PTR) bool {
+        self.processes_mutex.lock();
+        defer self.processes_mutex.unlock();
+
+        for (self.processes.items) |entry| {
+            if (client_process == @intFromPtr(entry)) {
+                return entry.shim_policy.is_cmd_exe;
             }
         }
         return false;
