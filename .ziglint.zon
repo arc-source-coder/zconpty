@@ -1,0 +1,25 @@
+.{
+    .paths = .{
+        // Build
+        "build.zig",
+        "build.zig.zon",
+        // Library
+        "src/lib.zig",
+        "src/server/",
+        "src/windows.zig",
+        "src/utils.zig",
+    },
+    .rules = .{
+        // Function name should be camelCase
+        // FFI functions and tests are snake_case
+        .Z001 = .{ .enabled = false },
+        // Variable names should be snake_case
+        // Windows API declarations are SCREAMING_SNAKE_CASE
+        .Z006 = .{ .enabled = false },
+        // Set maximum line length to 150.
+        .Z024 = .{ .max_length = 150 },
+        // Acronyms should use standard casing
+        // Windows API declarations are SCREAMING_SNAKE_CASE
+        .Z032 = .{ .enabled = false },
+    },
+}

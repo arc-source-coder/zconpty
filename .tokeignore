@@ -1,0 +1,5 @@
+# Avoid noise
+docs/
+# Copy of Windows API declarations from the Zig 0.16 standard library
+# TODO: Remove when upgrading to Zig 0.16
+src/windows
