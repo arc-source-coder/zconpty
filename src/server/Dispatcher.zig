@@ -68,8 +68,11 @@ pub fn handleConnect(
         tid,
         connect_msg.ProcessGroupId,
         process_handle,
-    ) catch {
-        ioCompletion.setStatus(completion, .NO_MEMORY);
+    ) catch |err| {
+        ioCompletion.setStatus(completion, switch (err) {
+            error.OutOfMemory => .NO_MEMORY,
+            error.SessionClosing => .UNSUCCESSFUL,
+        });
         return .complete;
     };
 

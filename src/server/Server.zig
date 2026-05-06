@@ -17,12 +17,19 @@ const ntSuccess = utils.ntSuccess;
 const handleIsValid = utils.handleIsValid;
 const ConDrvHandler = cdHandler.ConDrvHandler;
 
+// OpenConsole lets the hosting terminal return immediately because the console
+// server lives out of process. zconpty tears down synchronously inside the host,
+// so we keep a short grace period for cooperative exits and then fall back to
+// force-killing the still-attached console clients to keep window close bounded.
+const close_grace_timeout_ns: u64 = std.time.ns_per_s;
+const close_poll_interval_ns: u64 = 10 * std.time.ns_per_ms;
+const force_kill_settle_timeout_ns: u64 = 100 * std.time.ns_per_ms;
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     server_handle: windows.HANDLE,
     input_available_event: windows.HANDLE,
     thread: ?std.Thread,
-    child_process: windows.HANDLE,
     stop_requested: std.atomic.Value(bool),
     state: State,
     input_subsystem: Input,
@@ -48,7 +55,6 @@ pub fn create(
         .server_handle = windows.INVALID_HANDLE_VALUE,
         .input_available_event = windows.INVALID_HANDLE_VALUE,
         .thread = null,
-        .child_process = windows.INVALID_HANDLE_VALUE,
         .state = Session.State.init(allocator, terminal),
         .input_subsystem = undefined,
     };
@@ -112,17 +118,41 @@ pub fn start(session: *Session) windows.HRESULT {
 }
 
 pub fn stop(session: *Session) void {
-    session.state.dispatchControlEvent(windows.CTRL_CLOSE_EVENT, 0) catch |err| {
-        switch (err) {
-            error.InvalidParameter => {},
-        }
+    var close_targets = session.state.beginClose() catch |err| blk: {
+        std.log.warn("failed to snapshot close targets: {}", .{err});
+        break :blk sessionState.ControlTargetSnapshot.init(session.allocator);
     };
+    defer close_targets.deinit();
+
+    if (close_targets.targets.items.len != 0) {
+        sessionState.State.sendControlEventToSnapshot(&close_targets, windows.CTRL_CLOSE_EVENT) catch |err| {
+            std.log.warn("failed to dispatch CTRL_CLOSE_EVENT: {}", .{err});
+        };
+
+        const close_finished = waitForTrackedClientsToExit(session, close_grace_timeout_ns);
+        if (!close_finished and session.state.connectedProcessCount() != 0) {
+            std.log.warn(
+                "forcing termination for {d} tracked console client(s)",
+                .{session.state.connectedProcessCount()},
+            );
+
+            var remaining_targets = session.state.snapshotRemainingCloseTargets() catch |err| blk: {
+                std.log.warn("failed to snapshot remaining close targets: {}", .{err});
+                break :blk sessionState.ControlTargetSnapshot.init(session.allocator);
+            };
+            defer remaining_targets.deinit();
+
+            sessionState.State.forceTerminateSnapshot(&remaining_targets);
+            _ = waitForTrackedClientsToExit(session, force_kill_settle_timeout_ns);
+        }
+    }
 
     session.stop_requested.store(true, .release);
+    cancelOutstandingRead(session);
 
-    if (handleIsValid(session.server_handle)) {
-        _ = windows.NtClose(session.server_handle);
-        session.server_handle = windows.INVALID_HANDLE_VALUE;
+    if (session.thread) |thread| {
+        thread.join();
+        session.thread = null;
     }
 
     if (handleIsValid(session.input_available_event)) {
@@ -130,16 +160,9 @@ pub fn stop(session: *Session) void {
         session.input_available_event = windows.INVALID_HANDLE_VALUE;
     }
 
-    // Best effort: this may still block if the ConDrv read does not unwind promptly.
-    if (session.thread) |thread| {
-        thread.join();
-        session.thread = null;
-    }
-
-    if (handleIsValid(session.child_process)) {
-        _ = windows.NtTerminateProcess(session.child_process, .SUCCESS);
-        _ = windows.NtClose(session.child_process);
-        session.child_process = windows.INVALID_HANDLE_VALUE;
+    if (handleIsValid(session.server_handle)) {
+        _ = windows.NtClose(session.server_handle);
+        session.server_handle = windows.INVALID_HANDLE_VALUE;
     }
 
     const allocator = session.allocator;
@@ -321,7 +344,7 @@ fn launchChildWithConsoleReference(session: *Session) windows.HRESULT {
     }
 
     _ = windows.NtClose(process_info.hThread);
-    session.child_process = process_info.hProcess;
+    _ = windows.NtClose(process_info.hProcess);
 
     _ = windows.NtClose(reference_handle);
     _ = windows.NtClose(stdin_handle);
@@ -456,6 +479,35 @@ fn runLoopMain(session: *Session) void {
         } else {
             has_previous_complete = false;
         }
+    }
+
+    if (has_previous_complete and handleIsValid(session.server_handle)) {
+        const complete_status = handler.completeIo(&last_complete);
+        if (!ntSuccess(complete_status)) {
+            std.log.warn("final COMPLETE_IO failed: status=0x{x:0>8}", .{@intFromEnum(complete_status)});
+        }
+    }
+}
+
+fn waitForTrackedClientsToExit(session: *const Session, timeout_ns: u64) bool {
+    if (session.state.connectedProcessCount() == 0) return true;
+    var timer = std.time.Timer.start() catch return false;
+
+    while (session.state.connectedProcessCount() != 0) {
+        if (timer.read() >= timeout_ns) return false;
+        std.Thread.sleep(close_poll_interval_ns);
+    }
+
+    return true;
+}
+
+fn cancelOutstandingRead(session: *Session) void {
+    const thread = session.thread orelse return;
+
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    const status = windows.NtCancelSynchronousIoFile(thread.getHandle(), null, &iosb);
+    if (!ntSuccess(status) and status != .NOT_FOUND) {
+        std.log.warn("failed to cancel console read: status=0x{x:0>8}", .{@intFromEnum(status)});
     }
 }
 

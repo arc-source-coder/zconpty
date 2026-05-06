@@ -2,11 +2,13 @@ const std = @import("std");
 const windows = @import("../windows.zig");
 const process = @import("Process.zig");
 const utf = @import("utf.zig");
+const utils = @import("../utils.zig");
 
 pub const Terminal = @import("Terminal.zig");
 
 const Process = process.Process;
 const Handle = process.Process.Handle;
+const handleIsValid = utils.handleIsValid;
 
 pub const CursorState = struct {
     size_percent: u32 = 25,
@@ -193,9 +195,34 @@ const ConsoleControlFn = *const fn (
     console_information_length: windows.DWORD,
 ) callconv(.winapi) windows.NTSTATUS;
 
+const ControlTarget = struct {
+    pid: windows.DWORD,
+    process_handle: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
+};
+
+pub const ControlTargetSnapshot = struct {
+    allocator: std.mem.Allocator,
+    targets: std.ArrayList(ControlTarget),
+
+    pub fn init(allocator: std.mem.Allocator) ControlTargetSnapshot {
+        return .{ .allocator = allocator, .targets = .empty };
+    }
+
+    pub fn deinit(self: *ControlTargetSnapshot) void {
+        for (self.targets.items) |target| {
+            if (handleIsValid(target.process_handle)) {
+                _ = windows.NtClose(target.process_handle);
+            }
+        }
+        self.targets.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     terminal: Terminal,
+    closing: bool,
     /// Serializes the one cross-thread access we keep: processed Ctrl+C can
     /// dispatch from the host input thread while connect/disconnect mutate the
     /// process list on the console thread.
@@ -208,6 +235,7 @@ pub const State = struct {
         return .{
             .allocator = allocator,
             .terminal = terminal,
+            .closing = false,
             .processes_mutex = .{},
             .processes = .empty,
             .connected_process_count = std.atomic.Value(u32).init(0),
@@ -222,9 +250,54 @@ pub const State = struct {
         }
         self.processes.deinit(self.allocator);
         self.console.deinit(self.allocator);
+        self.closing = false;
         self.connected_process_count.store(0, .release);
         self.processes_mutex.unlock();
         self.* = undefined;
+    }
+
+    pub fn beginClose(self: *State) !ControlTargetSnapshot {
+        self.processes_mutex.lock();
+        defer self.processes_mutex.unlock();
+
+        self.closing = true;
+        return self.snapshotControlTargetsLocked(0, false);
+    }
+
+    pub fn snapshotRemainingCloseTargets(self: *State) !ControlTargetSnapshot {
+        self.processes_mutex.lock();
+        defer self.processes_mutex.unlock();
+
+        return self.snapshotControlTargetsLocked(0, true);
+    }
+
+    pub fn sendControlEventToSnapshot(
+        snapshot: *const ControlTargetSnapshot,
+        event_type: windows.ULONG,
+    ) !void {
+        const console_flags = consoleFlagsForEvent(event_type) orelse return error.InvalidParameter;
+        for (snapshot.targets.items) |target| {
+            sendConsoleEndTask(target.pid, event_type, console_flags);
+        }
+    }
+
+    pub fn forceTerminateSnapshot(snapshot: *const ControlTargetSnapshot) void {
+        for (snapshot.targets.items) |target| {
+            const duplicated_handle = target.process_handle;
+            const opened_handle = if (handleIsValid(duplicated_handle))
+                windows.INVALID_HANDLE_VALUE
+            else
+                windows.OpenProcess(windows.MAXIMUM_ALLOWED, .FALSE, target.pid) orelse windows.INVALID_HANDLE_VALUE;
+            const handle = if (handleIsValid(duplicated_handle)) duplicated_handle else opened_handle;
+            if (!handleIsValid(handle)) {
+                continue;
+            }
+            defer if (handleIsValid(opened_handle)) {
+                _ = windows.NtClose(opened_handle);
+            };
+
+            _ = windows.NtTerminateProcess(handle, .SUCCESS);
+        }
     }
 
     pub fn dispatchControlEvent(
@@ -232,25 +305,15 @@ pub const State = struct {
         event_type: windows.ULONG,
         process_group_id: windows.ULONG,
     ) !void {
-        const console_flags = consoleFlagsForEvent(event_type) orelse return error.InvalidParameter;
         self.processes_mutex.lock();
-        defer self.processes_mutex.unlock();
+        var snapshot = self.snapshotControlTargetsLocked(process_group_id, false) catch |err| {
+            self.processes_mutex.unlock();
+            return err;
+        };
+        self.processes_mutex.unlock();
+        defer snapshot.deinit();
 
-        var matched = false;
-        var index = self.processes.items.len;
-        while (index > 0) {
-            index -= 1;
-            const entry = self.processes.items[index];
-            if (process_group_id != 0 and entry.process_group_id != process_group_id) {
-                continue;
-            }
-            matched = true;
-            sendConsoleEndTask(entry.pid, event_type, console_flags);
-        }
-
-        if (process_group_id != 0 and !matched) {
-            return error.InvalidParameter;
-        }
+        try sendControlEventToSnapshot(&snapshot, event_type);
     }
 
     pub fn connectedProcessCount(self: *const State) u32 {
@@ -290,6 +353,13 @@ pub const State = struct {
     ) !*Process {
         self.processes_mutex.lock();
         defer self.processes_mutex.unlock();
+
+        if (self.closing) {
+            if (process_handle) |handle| {
+                _ = windows.NtClose(handle);
+            }
+            return error.SessionClosing;
+        }
 
         for (self.processes.items) |entry| {
             if (entry.pid != pid) continue;
@@ -377,6 +447,59 @@ pub const State = struct {
             );
         }
         self.processes.items.len -= 1;
+    }
+
+    fn snapshotControlTargetsLocked(
+        self: *State,
+        process_group_id: windows.ULONG,
+        duplicate_handles: bool,
+    ) !ControlTargetSnapshot {
+        var snapshot = ControlTargetSnapshot.init(self.allocator);
+        errdefer snapshot.deinit();
+
+        var matched = false;
+        var index = self.processes.items.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.processes.items[index];
+            if (process_group_id != 0 and entry.process_group_id != process_group_id) {
+                continue;
+            }
+
+            matched = true;
+            try snapshot.targets.append(self.allocator, .{
+                .pid = entry.pid,
+                .process_handle = if (duplicate_handles)
+                    duplicateTrackedProcessHandle(entry)
+                else
+                    windows.INVALID_HANDLE_VALUE,
+            });
+        }
+
+        if (process_group_id != 0 and !matched) return error.InvalidParameter;
+
+        return snapshot;
+    }
+
+    fn duplicateTrackedProcessHandle(process_entry: *const Process) windows.HANDLE {
+        const source_handle = process_entry.process_handle orelse return windows.INVALID_HANDLE_VALUE;
+
+        var duplicate_handle: windows.HANDLE = windows.INVALID_HANDLE_VALUE;
+        const current_process = windows.GetCurrentProcess();
+        if (windows.DuplicateHandle(
+            current_process,
+            source_handle,
+            current_process,
+            &duplicate_handle,
+            0,
+            .FALSE,
+            windows.DUPLICATE_SAME_ACCESS,
+        ) == .FALSE) {
+            std.log.warn("failed to duplicate process handle for pid={d}", .{process_entry.pid});
+            return windows.INVALID_HANDLE_VALUE;
+        }
+
+        return duplicate_handle;
     }
 
     fn consoleFlagsForEvent(event_type: windows.ULONG) ?windows.ULONG {
