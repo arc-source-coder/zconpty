@@ -29,10 +29,10 @@ pub const Context = struct {
 pub fn handleRead(
     message: *CONSOLE_DATA_PACKET,
     completion: *condrv.CD_IO_COMPLETE,
+    context: *const Context,
 ) DispatchResult {
-    _ = message;
-    ioCompletion.setUnsupported(completion);
-    return .complete;
+    var handler = apiHandler.ApiHandler.init(context.state, context.io, context.input);
+    return handler.handleRawRead(message, completion);
 }
 
 pub fn handleWrite(

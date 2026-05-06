@@ -438,7 +438,11 @@ fn runLoopMain(session: *Session) void {
         }
 
         const dispatch_result = switch (message.Descriptor.Function) {
-            condrv.CONSOLE_IO_RAW_READ => dispatcher.handleRead(&message, &next_complete),
+            condrv.CONSOLE_IO_RAW_READ => dispatcher.handleRead(
+                &message,
+                &next_complete,
+                &context,
+            ),
             condrv.CONSOLE_IO_RAW_WRITE => dispatcher.handleWrite(
                 &message,
                 &next_complete,

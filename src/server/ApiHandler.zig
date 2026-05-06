@@ -185,6 +185,31 @@ pub const ApiHandler = struct {
         };
     }
 
+    pub fn handleRawRead(
+        self: *ApiHandler,
+        message: *CONSOLE_DATA_PACKET,
+        completion: *condrv.CD_IO_COMPLETE,
+    ) DispatchResult {
+        const handle = getHandle(message) orelse {
+            ioCompletion.setStatus(completion, .INVALID_HANDLE);
+            return .complete;
+        };
+
+        if (handle.type != .Input or !hasRequiredAccess(handle, windows.GENERIC_READ)) {
+            ioCompletion.setStatus(completion, .ACCESS_DENIED);
+            return .complete;
+        }
+
+        return switch (self.input.beginRawRead(message, completion)) {
+            .completed => .complete,
+            .pending => .pending,
+            .failed => |status| blk: {
+                ioCompletion.setStatus(completion, status);
+                break :blk .complete;
+            },
+        };
+    }
+
     pub fn handleGetConsoleCP(
         self: *ApiHandler,
         message: *CONSOLE_DATA_PACKET,

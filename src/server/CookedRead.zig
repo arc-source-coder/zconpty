@@ -18,12 +18,12 @@ pub const Slot = struct {
 
     pub fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         if (self.active) |*active| {
             active.deinit(allocator);
         }
 
+        self.mutex.unlock();
         self.* = undefined;
     }
 };

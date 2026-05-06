@@ -17,10 +17,16 @@ const Terminal = terminal_mod;
 pub const History = history_mod.History;
 
 pub const PendingRead = struct {
+    target: Target = .read_console,
     identifier: windows.LUID,
     write_offset: windows.ULONG,
     capacity: windows.ULONG,
     reply: console_msg.L1.CONSOLE_READCONSOLE_MSG,
+
+    pub const Target = enum {
+        read_console,
+        raw_io,
+    };
 };
 
 pub const Active = struct {

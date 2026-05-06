@@ -18,6 +18,7 @@ const utils = @import("../utils.zig");
 const ConDrvHandler = condrv_handler.ConDrvHandler;
 const CookedRead = cooked_read;
 const InputMode = session_state.InputMode;
+const ReadTarget = CookedRead.PendingRead.Target;
 const State = session_state.State;
 const Terminal = terminal_mod;
 
@@ -51,11 +52,12 @@ pub const BeginResult = union(enum) {
 
 pub const VtInputSlot = struct {
     mutex: std.Thread.Mutex = .{},
-    pending_read: ?PendingRead = null,
+    pending_read: ?PendingByteRead = null,
     overflow: std.ArrayList(u8) = .empty,
 };
 
-pub const PendingRead = struct {
+pub const PendingByteRead = struct {
+    target: ReadTarget = .read_console,
     identifier: windows.LUID,
     write_offset: windows.ULONG,
     capacity: windows.ULONG,
@@ -66,15 +68,8 @@ pub const InputBuffer = struct {
     mutex: std.Thread.Mutex = .{},
     storage: std.ArrayList(windows.INPUT_RECORD) = .empty,
     vt_byte_storage: std.ArrayList(u8) = .empty,
-    pending_text_read: ?PendingTextRead = null,
+    pending_text_read: ?PendingByteRead = null,
     pending_waiter: ?PendingWaiter = null,
-};
-
-pub const PendingTextRead = struct {
-    identifier: windows.LUID,
-    write_offset: windows.ULONG,
-    capacity: windows.ULONG,
-    reply: console_msg.L1.CONSOLE_READCONSOLE_MSG,
 };
 
 const ReadConsoleBegin = struct {
@@ -135,7 +130,7 @@ const GetConsoleInputResult = struct {
 const LegacyCompletion = union(enum) {
     none,
     text_read: struct {
-        pending: PendingTextRead,
+        pending: PendingByteRead,
         result: ReadConsoleResult,
     },
     waiter: struct {
@@ -293,6 +288,27 @@ pub fn beginReadConsole(
     return self.beginVtReadConsole(message, completion);
 }
 
+pub fn beginRawRead(
+    self: *Self,
+    message: *api_msg.CONSOLE_DATA_PACKET,
+    completion: *condrv.CD_IO_COMPLETE,
+) BeginResult {
+    if (message.Descriptor.OutputSize == 0) {
+        return .{ .failed = .BUFFER_TOO_SMALL };
+    }
+
+    const input_mode = self.loadInputMode();
+    if (input_mode.enable_line_input) {
+        return self.beginCookedRawRead(message);
+    }
+
+    if (!input_mode.enable_virtual_terminal_input) {
+        return self.beginLegacyRead(rawReadPending(self, message), null, completion);
+    }
+
+    return self.beginVtRead(rawReadPending(self, message), null, completion);
+}
+
 pub fn redrawCookedAfterHostOutput(self: *Self) void {
     self.redrawCookedIfActive();
 }
@@ -311,9 +327,23 @@ fn beginVtReadConsole(
     message: *api_msg.CONSOLE_DATA_PACKET,
     completion: *condrv.CD_IO_COMPLETE,
 ) BeginResult {
+    const begin = readConsoleBegin(message) orelse return .{ .failed = .INVALID_PARAMETER };
+    return self.beginVtRead(.{
+        .identifier = begin.identifier,
+        .write_offset = begin.write_offset,
+        .capacity = begin.capacity,
+        .reply = begin.reply.*,
+    }, begin.reply, completion);
+}
+
+fn beginVtRead(
+    self: *Self,
+    pending_read: PendingByteRead,
+    reply_out: ?*console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    completion: *condrv.CD_IO_COMPLETE,
+) BeginResult {
     self.setPreferredReader(.vt);
 
-    const begin = readConsoleBegin(message) orelse return .{ .failed = .INVALID_PARAMETER };
     var overflow: std.ArrayList(u8) = .empty;
     defer overflow.deinit(self.allocator);
 
@@ -328,11 +358,10 @@ fn beginVtReadConsole(
         self.vt_input_slot.mutex.unlock();
         vt_locked = false;
 
-        const written = self.completeReadConsole(
-            begin.identifier,
-            begin.write_offset,
-            begin.capacity,
-            begin.reply,
+        const written = self.finishPendingVtReadInline(
+            completion,
+            pending_read,
+            reply_out,
             overflow.items,
         ) catch |err| return .{ .failed = utils.mapError(err) };
 
@@ -345,21 +374,10 @@ fn beginVtReadConsole(
         }
         overflow.items.len = 0;
         self.vt_input_slot.mutex.unlock();
-        io_completion.setWriteBuffer(
-            completion,
-            @ptrCast(begin.reply),
-            @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG),
-        );
-        io_completion.setSuccessWithInformation(completion, begin.reply.NumBytes);
         return .completed;
     }
 
-    self.vt_input_slot.pending_read = .{
-        .identifier = begin.identifier,
-        .write_offset = begin.write_offset,
-        .capacity = begin.capacity,
-        .reply = begin.reply.*,
-    };
+    self.vt_input_slot.pending_read = pending_read;
     return .pending;
 }
 
@@ -397,14 +415,50 @@ fn beginCookedReadConsole(self: *Self, message: *api_msg.CONSOLE_DATA_PACKET) Be
     return .pending;
 }
 
+fn beginCookedRawRead(self: *Self, message: *api_msg.CONSOLE_DATA_PACKET) BeginResult {
+    self.cooked_read_slot.mutex.lock();
+    defer self.cooked_read_slot.mutex.unlock();
+
+    if (self.cooked_read_slot.active != null) return .{ .failed = .INVALID_PARAMETER };
+
+    self.setPreferredReader(.legacy);
+
+    self.cooked_read_slot.active = CookedRead.initActive(
+        self.allocator,
+        .{
+            .target = .raw_io,
+            .identifier = message.Descriptor.Identifier,
+            .write_offset = 0,
+            .capacity = message.Descriptor.OutputSize,
+            .reply = rawReadReply(self),
+        },
+        null,
+        "",
+    ) catch |err| return .{ .failed = utils.mapError(err) };
+    return .pending;
+}
+
 fn beginRawReadConsole(
     self: *Self,
     message: *api_msg.CONSOLE_DATA_PACKET,
     completion: *condrv.CD_IO_COMPLETE,
 ) BeginResult {
-    self.setPreferredReader(.legacy);
-
     const begin = readConsoleBegin(message) orelse return .{ .failed = .INVALID_PARAMETER };
+    return self.beginLegacyRead(.{
+        .identifier = begin.identifier,
+        .write_offset = begin.write_offset,
+        .capacity = begin.capacity,
+        .reply = begin.reply.*,
+    }, begin.reply, completion);
+}
+
+fn beginLegacyRead(
+    self: *Self,
+    pending_read: PendingByteRead,
+    reply_out: ?*console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    completion: *condrv.CD_IO_COMPLETE,
+) BeginResult {
+    self.setPreferredReader(.legacy);
 
     var result: ?ReadConsoleResult = null;
     defer if (result) |*value| value.deinit(self.allocator);
@@ -419,33 +473,185 @@ fn beginRawReadConsole(
 
     if (self.rawReadReadyLocked()) {
         result = self.collectReadConsoleResultLocked(
-            begin.capacity,
-            begin.reply.*,
+            pending_read.capacity,
+            pending_read.reply,
         ) catch |err| {
             return .{ .failed = utils.mapError(err) };
         };
         self.input_buffer.mutex.unlock();
         input_locked = false;
 
-        self.completeReadConsoleResult(begin.identifier, begin.write_offset, result.?) catch |err| return .{ .failed = utils.mapError(err) };
+        self.finishPendingReadResultInline(completion, pending_read, reply_out, result.?) catch |err| {
+            return .{ .failed = utils.mapError(err) };
+        };
 
         self.input_buffer.mutex.lock();
         commitReadConsoleResultLocked(&self.input_buffer, result.?);
         self.resetInputAvailableIfDrained();
         self.input_buffer.mutex.unlock();
-        begin.reply.* = result.?.reply;
-        io_completion.setWriteBuffer(completion, @ptrCast(begin.reply), @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG));
-        io_completion.setSuccessWithInformation(completion, result.?.payload.len);
         return .completed;
     }
 
-    self.input_buffer.pending_text_read = .{
-        .identifier = begin.identifier,
-        .write_offset = begin.write_offset,
-        .capacity = begin.capacity,
-        .reply = begin.reply.*,
-    };
+    self.input_buffer.pending_text_read = pending_read;
     return .pending;
+}
+
+fn rawReadPending(self: *const Self, message: *const api_msg.CONSOLE_DATA_PACKET) PendingByteRead {
+    return .{
+        .target = .raw_io,
+        .identifier = message.Descriptor.Identifier,
+        .write_offset = 0,
+        .capacity = message.Descriptor.OutputSize,
+        .reply = rawReadReply(self),
+    };
+}
+
+fn rawReadReply(self: *const Self) console_msg.L1.CONSOLE_READCONSOLE_MSG {
+    var reply: console_msg.L1.CONSOLE_READCONSOLE_MSG = std.mem.zeroes(console_msg.L1.CONSOLE_READCONSOLE_MSG);
+    reply.ProcessControlZ = if (self.processedInputModeEnabled()) .TRUE else .FALSE;
+    return reply;
+}
+
+fn finishPendingVtReadInline(
+    self: *Self,
+    completion: *condrv.CD_IO_COMPLETE,
+    pending: PendingByteRead,
+    reply_out: ?*console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    bytes: []const u8,
+) !usize {
+    const delivered = pendingReadDelivery(pending, bytes);
+    if (delivered.delivered > 0) {
+        try self.writeOutput(
+            pending.identifier,
+            pending.write_offset,
+            bytes[0..delivered.delivered],
+        );
+    }
+
+    switch (pending.target) {
+        .read_console => finishReadConsoleInlineCompletion(
+            completion,
+            reply_out orelse return error.InvalidParameter,
+            pending.reply,
+            delivered.delivered,
+        ),
+        .raw_io => finishRawReadInlineCompletion(completion, delivered.delivered),
+    }
+    return delivered.consumed;
+}
+
+fn finishPendingReadResultInline(
+    self: *Self,
+    completion: *condrv.CD_IO_COMPLETE,
+    pending: PendingByteRead,
+    reply_out: ?*console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    result: ReadConsoleResult,
+) !void {
+    if (result.payload.len > 0) {
+        try self.writeOutput(
+            pending.identifier,
+            pending.write_offset,
+            result.payload,
+        );
+    }
+
+    switch (pending.target) {
+        .read_console => finishReadConsoleInlineCompletion(
+            completion,
+            reply_out orelse return error.InvalidParameter,
+            result.reply,
+            result.payload.len,
+        ),
+        .raw_io => finishRawReadInlineCompletion(completion, result.payload.len),
+    }
+}
+
+fn finishPendingVtReadAsync(
+    self: *Self,
+    pending: PendingByteRead,
+    bytes: []const u8,
+) !usize {
+    const delivered = pendingReadDelivery(pending, bytes);
+    if (delivered.delivered > 0) {
+        try self.writeOutput(
+            pending.identifier,
+            pending.write_offset,
+            bytes[0..delivered.delivered],
+        );
+    }
+
+    switch (pending.target) {
+        .read_console => try self.completeReadConsoleStatus(
+            pending.identifier,
+            pending.reply,
+            .SUCCESS,
+            delivered.delivered,
+        ),
+        .raw_io => try self.completeRawReadStatus(
+            pending.identifier,
+            .SUCCESS,
+            delivered.delivered,
+        ),
+    }
+    return delivered.consumed;
+}
+
+fn finishPendingReadResultAsync(
+    self: *Self,
+    pending: PendingByteRead,
+    result: ReadConsoleResult,
+    status: windows.NTSTATUS,
+    control_key_state: windows.ULONG,
+) !void {
+    switch (pending.target) {
+        .read_console => try self.completeReadConsoleResult(
+            pending.identifier,
+            pending.write_offset,
+            result,
+            status,
+            control_key_state,
+        ),
+        .raw_io => try self.completeRawReadResult(
+            pending.identifier,
+            pending.write_offset,
+            result.payload,
+            status,
+        ),
+    }
+}
+
+fn finishReadConsoleInlineCompletion(
+    completion: *condrv.CD_IO_COMPLETE,
+    reply_out: *console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    reply_template: console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    delivered: usize,
+) void {
+    reply_out.* = reply_template;
+    reply_out.NumBytes = @intCast(delivered);
+    reply_out.ControlKeyState = 0;
+    io_completion.setWriteBuffer(
+        completion,
+        @ptrCast(reply_out),
+        @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG),
+    );
+    io_completion.setSuccessWithInformation(completion, delivered);
+}
+
+fn finishRawReadInlineCompletion(completion: *condrv.CD_IO_COMPLETE, delivered: usize) void {
+    io_completion.setSuccessWithInformation(completion, delivered);
+}
+
+fn pendingReadDelivery(
+    pending: PendingByteRead,
+    bytes: []const u8,
+) struct { consumed: usize, delivered: usize } {
+    const consumed = @min(bytes.len, @as(usize, @intCast(pending.capacity)));
+    var delivered = consumed;
+    if (pending.reply.ProcessControlZ != .FALSE and consumed > 0 and bytes[0] == 0x1A) {
+        delivered = 0;
+    }
+
+    return .{ .consumed = consumed, .delivered = delivered };
 }
 
 pub fn beginGetConsoleInput(
@@ -690,15 +896,12 @@ fn deliverVtBytes(self: *Self, bytes: []const u8) void {
 
     self.vt_input_slot.mutex.lock();
     if (self.vt_input_slot.pending_read) |pending_value| {
-        var pending = pending_value;
+        const pending = pending_value;
         self.vt_input_slot.pending_read = null;
         self.vt_input_slot.mutex.unlock();
 
-        const consumed = self.completeReadConsole(
-            pending.identifier,
-            pending.write_offset,
-            pending.capacity,
-            &pending.reply,
+        const consumed = self.finishPendingVtReadAsync(
+            pending,
             bytes,
         ) catch {
             self.vt_input_slot.mutex.lock();
@@ -770,30 +973,6 @@ fn deliverLegacyVtBytes(self: *Self, bytes: []const u8) void {
     self.finishLegacyCompletion(&completion);
 }
 
-fn completeReadConsole(
-    self: *Self,
-    identifier: windows.LUID,
-    write_offset: windows.ULONG,
-    capacity: windows.ULONG,
-    reply: *console_msg.L1.CONSOLE_READCONSOLE_MSG,
-    bytes: []const u8,
-) !usize {
-    const consumed = @min(bytes.len, @as(usize, @intCast(capacity)));
-    var delivered = consumed;
-    if (reply.ProcessControlZ != .FALSE and consumed > 0 and bytes[0] == 0x1a) {
-        delivered = 0;
-    }
-
-    if (delivered > 0) {
-        try self.writeOutput(identifier, write_offset, bytes[0..delivered]);
-    }
-
-    reply.NumBytes = @intCast(delivered);
-    reply.ControlKeyState = 0;
-    try self.completeReply(identifier, @ptrCast(reply), @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG), delivered);
-    return consumed;
-}
-
 fn writeOutput(
     self: *Self,
     identifier: windows.LUID,
@@ -844,6 +1023,55 @@ fn completeReplyStatus(
     io_completion.setCompletion(&completion, status, @as(windows.ULONG_PTR, information));
     const ntstatus = io.completeIo(&completion);
     if (!ntSuccess(ntstatus)) return error.CompleteIoFailed;
+}
+
+fn completeReadConsoleStatus(
+    self: *Self,
+    identifier: windows.LUID,
+    reply_template: console_msg.L1.CONSOLE_READCONSOLE_MSG,
+    status: windows.NTSTATUS,
+    information: usize,
+) !void {
+    var reply = reply_template;
+    reply.NumBytes = @intCast(information);
+    reply.ControlKeyState = 0;
+    try self.completeReplyStatus(
+        identifier,
+        @ptrCast(&reply),
+        @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG),
+        status,
+        information,
+    );
+}
+
+fn completeRawReadStatus(
+    self: *Self,
+    identifier: windows.LUID,
+    status: windows.NTSTATUS,
+    information: usize,
+) !void {
+    var completion: condrv.CD_IO_COMPLETE = std.mem.zeroes(condrv.CD_IO_COMPLETE);
+    completion.Identifier = identifier;
+    io_completion.setWritePlaceholder(&completion);
+    io_completion.setCompletion(&completion, status, @as(windows.ULONG_PTR, information));
+
+    var io = ConDrvHandler.init(self.server_handle);
+    const ntstatus = io.completeIo(&completion);
+    if (!ntSuccess(ntstatus)) return error.CompleteIoFailed;
+}
+
+fn completeRawReadResult(
+    self: *Self,
+    identifier: windows.LUID,
+    write_offset: windows.ULONG,
+    payload: []const u8,
+    status: windows.NTSTATUS,
+) !void {
+    if (payload.len > 0) {
+        try self.writeOutput(identifier, write_offset, payload);
+    }
+
+    try self.completeRawReadStatus(identifier, status, payload.len);
 }
 
 fn signalInputAvailableLocked(self: *Self) void {
@@ -903,10 +1131,11 @@ fn finishLegacyCompletion(self: *Self, completion: *LegacyCompletion) void {
     switch (completion.*) {
         .none => {},
         .text_read => |value| {
-            self.completeReadConsoleResult(
-                value.pending.identifier,
-                value.pending.write_offset,
+            self.finishPendingReadResultAsync(
+                value.pending,
                 value.result,
+                .SUCCESS,
+                0,
             ) catch {
                 self.input_buffer.mutex.lock();
                 defer self.input_buffer.mutex.unlock();
@@ -1042,16 +1271,20 @@ fn completeReadConsoleResult(
     identifier: windows.LUID,
     write_offset: windows.ULONG,
     result: ReadConsoleResult,
+    status: windows.NTSTATUS,
+    control_key_state: windows.ULONG,
 ) !void {
     if (result.payload.len > 0) {
         try self.writeOutput(identifier, write_offset, result.payload);
     }
 
     var reply = result.reply;
-    try self.completeReply(
+    reply.ControlKeyState = control_key_state;
+    try self.completeReplyStatus(
         identifier,
         @ptrCast(&reply),
         @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG),
+        status,
         result.payload.len,
     );
 }
@@ -1346,24 +1579,25 @@ fn finishCookedCompletionLocked(self: *Self, completion: CookedRead.Completion) 
         };
     }
 
-    var reply = pending.reply;
     const delivered = @min(completion.payload.len, @as(usize, @intCast(pending.capacity)));
     var completion_failed = false;
-    if (delivered > 0) {
-        self.writeOutput(pending.identifier, pending.write_offset, completion.payload[0..delivered]) catch {
-            completion_failed = true;
-        };
-    }
-
     if (!completion_failed) {
-        reply.NumBytes = @intCast(delivered);
-        reply.ControlKeyState = completion.control_key_state;
-        self.completeReplyStatus(
-            pending.identifier,
-            @ptrCast(&reply),
-            @sizeOf(console_msg.L1.CONSOLE_READCONSOLE_MSG),
+        const result: ReadConsoleResult = .{
+            .reply = pending.reply,
+            .payload = completion.payload[0..delivered],
+            .consume = .{},
+        };
+        self.finishPendingReadResultAsync(
+            .{
+                .target = pending.target,
+                .identifier = pending.identifier,
+                .write_offset = pending.write_offset,
+                .capacity = pending.capacity,
+                .reply = pending.reply,
+            },
+            result,
             completion.status,
-            delivered,
+            completion.control_key_state,
         ) catch {
             completion_failed = true;
         };
@@ -1569,6 +1803,172 @@ fn deriveCtrlLetterUnicodeChar(win_vk: u16, control_state: windows.DWORD) window
     if (win_vk < 'A' or win_vk > 'Z') return 0;
 
     return @as(windows.WCHAR, @intCast((win_vk - 'A') + 1));
+}
+
+const TestTerminal = struct {
+    const vtable: Terminal.VTable = .{
+        .feed = feed,
+        .vt_encode_key = noVtEncodeKey,
+        .vt_encode_mouse = noVtEncodeMouse,
+        .vt_encode_focus = noVtEncodeFocus,
+        .vt_encode_paste = noVtEncodePaste,
+        .get_size = getSize,
+        .get_cursor_position = getCursorPosition,
+        .get_cursor_visible = getCursorVisible,
+        .get_cell_size = getCellSize,
+        .get_title = getTitle,
+        .get_base16_palette = getBase16Palette,
+        .read_rect = readRect,
+        .write_rect = writeRect,
+        .fill_span = fillSpan,
+    };
+
+    fn terminal(self: *TestTerminal) Terminal {
+        return Terminal.init(self, &vtable);
+    }
+
+    fn feed(_: *anyopaque, _: []const u8) void {}
+    fn noVtEncodeKey(_: *anyopaque, _: *const input_types.KeyEvent, _: [*]u8, _: usize) usize {
+        return 0;
+    }
+    fn noVtEncodeMouse(_: *anyopaque, _: *const input_types.MouseEvent, _: [*]u8, _: usize) usize {
+        return 0;
+    }
+    fn noVtEncodeFocus(_: *anyopaque, _: bool, _: [*]u8, _: usize) usize {
+        return 0;
+    }
+    fn noVtEncodePaste(_: *anyopaque, _: [*]u8, _: [*]const u8, _: usize, _: usize) usize {
+        return 0;
+    }
+    fn getSize(_: *anyopaque, cols: *u16, rows: *u16) void {
+        cols.* = 80;
+        rows.* = 25;
+    }
+    fn getCursorPosition(_: *anyopaque, col: *u16, row: *u16) void {
+        col.* = 0;
+        row.* = 0;
+    }
+    fn getCursorVisible(_: *anyopaque, visible: *bool) void {
+        visible.* = true;
+    }
+    fn getCellSize(_: *anyopaque, width_px: *u16, height_px: *u16) void {
+        width_px.* = 8;
+        height_px.* = 16;
+    }
+    fn getTitle(_: *anyopaque, _: [*]u8, _: usize) usize {
+        return 0;
+    }
+    fn getBase16Palette(_: *anyopaque, out: *[16]terminal_mod.RGB) void {
+        out.* = std.mem.zeroes([16]terminal_mod.RGB);
+    }
+    fn readRect(_: *anyopaque, rect: terminal_mod.Rect, _: [*]terminal_mod.Cell) terminal_mod.Rect {
+        return rect;
+    }
+    fn writeRect(_: *anyopaque, rect: terminal_mod.Rect, _: [*]const terminal_mod.Cell) terminal_mod.Rect {
+        return rect;
+    }
+    fn fillSpan(_: *anyopaque, _: terminal_mod.Point, _: u32, _: terminal_mod.FillKind, _: terminal_mod.Cell) u32 {
+        return 0;
+    }
+};
+
+test "raw read with line input installs cooked pending read" {
+    var terminal_state: TestTerminal = .{};
+    var state = State.init(std.testing.allocator, terminal_state.terminal());
+    defer state.deinit();
+
+    var input: Self = undefined;
+    input.init(
+        std.testing.allocator,
+        windows.INVALID_HANDLE_VALUE,
+        &state,
+        terminal_state.terminal(),
+        &state.console.input_mode,
+    );
+    defer input.deinit();
+
+    var message: api_msg.CONSOLE_DATA_PACKET = std.mem.zeroes(api_msg.CONSOLE_DATA_PACKET);
+    message.Descriptor.OutputSize = 1;
+
+    var completion: condrv.CD_IO_COMPLETE = std.mem.zeroes(condrv.CD_IO_COMPLETE);
+    const result = input.beginRawRead(&message, &completion);
+    try std.testing.expect(result == .pending);
+
+    input.cooked_read_slot.mutex.lock();
+    defer input.cooked_read_slot.mutex.unlock();
+    try std.testing.expect(input.cooked_read_slot.active != null);
+    try std.testing.expectEqual(ReadTarget.raw_io, input.cooked_read_slot.active.?.pending.target);
+    try std.testing.expect(input.cooked_read_slot.active.?.pending.reply.ProcessControlZ != .FALSE);
+}
+
+test "raw read with vt input installs pending vt read" {
+    var terminal_state: TestTerminal = .{};
+    var state = State.init(std.testing.allocator, terminal_state.terminal());
+    defer state.deinit();
+
+    var mode = state.console.loadInputMode(.acquire);
+    mode.enable_line_input = false;
+    mode.enable_echo_input = false;
+    mode.enable_virtual_terminal_input = true;
+    state.console.storeInputMode(.release, mode);
+
+    var input: Self = undefined;
+    input.init(
+        std.testing.allocator,
+        windows.INVALID_HANDLE_VALUE,
+        &state,
+        terminal_state.terminal(),
+        &state.console.input_mode,
+    );
+    defer input.deinit();
+
+    var message: api_msg.CONSOLE_DATA_PACKET = std.mem.zeroes(api_msg.CONSOLE_DATA_PACKET);
+    message.Descriptor.OutputSize = 8;
+
+    var completion: condrv.CD_IO_COMPLETE = std.mem.zeroes(condrv.CD_IO_COMPLETE);
+    const result = input.beginRawRead(&message, &completion);
+    try std.testing.expect(result == .pending);
+
+    input.vt_input_slot.mutex.lock();
+    defer input.vt_input_slot.mutex.unlock();
+    try std.testing.expect(input.vt_input_slot.pending_read != null);
+    try std.testing.expectEqual(ReadTarget.raw_io, input.vt_input_slot.pending_read.?.target);
+}
+
+test "raw read inline completion converts ctrl-z to eof" {
+    var terminal_state: TestTerminal = .{};
+    var state = State.init(std.testing.allocator, terminal_state.terminal());
+    defer state.deinit();
+
+    var input: Self = undefined;
+    input.init(
+        std.testing.allocator,
+        windows.INVALID_HANDLE_VALUE,
+        &state,
+        terminal_state.terminal(),
+        &state.console.input_mode,
+    );
+    defer input.deinit();
+
+    var completion: condrv.CD_IO_COMPLETE = std.mem.zeroes(condrv.CD_IO_COMPLETE);
+    io_completion.setWritePlaceholder(&completion);
+
+    const pending: PendingByteRead = .{
+        .target = .raw_io,
+        .identifier = std.mem.zeroes(windows.LUID),
+        .write_offset = 0,
+        .capacity = 1,
+        .reply = rawReadReply(&input),
+    };
+    const consumed = try input.finishPendingVtReadInline(
+        &completion,
+        pending,
+        null,
+        &[_]u8{0x1A},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), consumed);
+    try std.testing.expectEqual(@as(windows.ULONG_PTR, 0), completion.IoStatus.Information);
 }
 
 test "legacy key synthesis maps ctrl+backspace to word erase" {
