@@ -564,6 +564,6 @@ pub fn handleDispatch(
         .get_console_process_list => .complete,
         .get_history => .complete,
         .set_history => .complete,
-        .set_current_font => .complete,
+        .set_current_font => handler.handleSetCurrentConsoleFont(message, completion),
     };
 }

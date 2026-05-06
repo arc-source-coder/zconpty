@@ -521,6 +521,7 @@ pub const ApiHandler = struct {
             return .complete;
         }
 
+        // Return placeholder values to maintain compatiblity with legacy console programs.
         var width_px: u16 = 0;
         var height_px: u16 = 0;
         self.state.terminal.getCellSize(&width_px, &height_px);
@@ -536,6 +537,26 @@ pub const ApiHandler = struct {
         @memset(msg.FaceName[0..], 0);
         writeFaceName("Consolas", &msg.FaceName);
 
+        ioCompletion.setSuccess(completion);
+        return .complete;
+    }
+
+    pub fn handleSetCurrentConsoleFont(
+        _: *ApiHandler,
+        message: *CONSOLE_DATA_PACKET,
+        completion: *condrv.CD_IO_COMPLETE,
+    ) DispatchResult {
+        const handle = getHandle(message) orelse {
+            ioCompletion.setStatus(completion, .INVALID_HANDLE);
+            return .complete;
+        };
+
+        if (!hasRequiredAccess(handle, windows.GENERIC_WRITE)) {
+            ioCompletion.setStatus(completion, .ACCESS_DENIED);
+            return .complete;
+        }
+
+        // Return placeholder values to maintain compatiblity with legacy console programs.
         ioCompletion.setSuccess(completion);
         return .complete;
     }
