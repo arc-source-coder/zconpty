@@ -8,6 +8,8 @@
         "src/server/",
         "src/windows.zig",
         "src/utils.zig",
+        // WSL integration
+        "src/wsl/",
     },
     .rules = .{
         // Function name should be camelCase

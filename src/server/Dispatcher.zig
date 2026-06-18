@@ -61,7 +61,25 @@ pub fn handleConnect(
         return .complete;
     }
 
-    const process_handle = windows.OpenProcess(windows.MAXIMUM_ALLOWED, .FALSE, pid);
+    var process_handle: windows.HANDLE = undefined;
+    const query_oa: windows.OBJECT.ATTRIBUTES = .{ .ObjectName = null };
+
+    var client_id = std.mem.zeroes(windows.CLIENT_ID);
+    client_id.UniqueProcess = @ptrFromInt(pid);
+
+    const open_status = windows.NtOpenProcess(
+        &process_handle,
+        .{ .SPECIFIC = .{ .PROCESS = .{
+            .TERMINATE = true,
+            .QUERY_LIMITED_INFORMATION = true,
+        } } },
+        &query_oa,
+        &client_id,
+    );
+    if (!ntSuccess(open_status)) {
+        ioCompletion.setStatus(completion, open_status);
+        return .complete;
+    }
 
     const process_entry = context.state.registerProcess(
         pid,
@@ -171,7 +189,16 @@ pub fn handleDisconnect(
     completion: *condrv.CD_IO_COMPLETE,
     context: *const Context,
 ) DispatchResult {
-    _ = context.state.unregisterProcessByClientPointer(message.Descriptor.Process);
+    if (context.state.wslz_session) |session| {
+        if (session.client == message.Descriptor.Process) {
+            context.input.target = .Condrv;
+            session.deinit();
+            context.state.allocator.destroy(session);
+            context.state.wslz_session = null;
+        }
+    }
+    const entry: *process.Process = @ptrFromInt(message.Descriptor.Process);
+    context.state.unregisterProcess(entry);
 
     ioCompletion.setSuccess(completion);
     return .complete;
@@ -359,6 +386,8 @@ pub const ApiNumber = enum(u32) {
     get_history = 0x0300002a,
     set_history = 0x0300002b,
     set_current_font = 0x0300002c,
+    wslz_bootstrap = 0x0300002d,
+    wslz_set_interop_mode = 0x0300002e,
 };
 
 fn requiredDescriptorSize(api_number: windows.ULONG) ?windows.ULONG {
@@ -448,6 +477,8 @@ fn requiredDescriptorSize(api_number: windows.ULONG) ?windows.ULONG {
         @intFromEnum(ApiNumber.get_history) => @sizeOf(consoleMsg.L3.CONSOLE_HISTORY_MSG),
         @intFromEnum(ApiNumber.set_history) => @sizeOf(consoleMsg.L3.CONSOLE_HISTORY_MSG),
         @intFromEnum(ApiNumber.set_current_font) => @sizeOf(consoleMsg.L3.CONSOLE_CURRENTFONT_MSG),
+        @intFromEnum(ApiNumber.wslz_bootstrap) => @sizeOf(consoleMsg.L3.CONSOLE_WSLZ_BOOTSTRAP_MSG),
+        @intFromEnum(ApiNumber.wslz_set_interop_mode) => @sizeOf(consoleMsg.L3.CONSOLE_WSLZ_SET_INTEROP_MODE_MSG),
 
         else => null,
     };
@@ -565,5 +596,7 @@ pub fn handleDispatch(
         .get_history => .complete,
         .set_history => .complete,
         .set_current_font => handler.handleSetCurrentConsoleFont(message, completion),
+        .wslz_bootstrap => handler.handleWslzBootstrap(message, completion),
+        .wslz_set_interop_mode => handler.handleWslzSetInteropMode(message, completion),
     };
 }

@@ -7,7 +7,7 @@ pub const Process = struct {
     pid: windows.DWORD,
     tid: windows.DWORD,
     process_group_id: windows.ULONG,
-    process_handle: ?windows.HANDLE,
+    process_handle: windows.HANDLE,
     policy: Policy,
     shim_policy: ShimPolicy,
     input_handle: ?*Handle,
@@ -18,7 +18,7 @@ pub const Process = struct {
         pid: windows.DWORD,
         tid: windows.DWORD,
         process_group_id: windows.ULONG,
-        process_handle: ?windows.HANDLE,
+        process_handle: windows.HANDLE,
     ) Process {
         return .{
             .pid = pid,
@@ -50,16 +50,11 @@ pub const Process = struct {
         can_read_output_buffer: bool,
         can_write_input_buffer: bool,
 
-        fn init(process_handle: ?windows.HANDLE) Policy {
-            const handle = process_handle orelse return .{
-                .can_read_output_buffer = false,
-                .can_write_input_buffer = false,
-            };
-
+        fn init(process_handle: windows.HANDLE) Policy {
             var can_read_output_buffer = false;
             var can_write_input_buffer = false;
             processPolicies.applyConsoleAccessPolicy(
-                handle,
+                process_handle,
                 &can_read_output_buffer,
                 &can_write_input_buffer,
             );
@@ -74,16 +69,12 @@ pub const Process = struct {
         is_cmd_exe: bool,
         is_powershell_exe: bool,
 
-        fn init(process_handle: ?windows.HANDLE) ShimPolicy {
-            const handle = process_handle orelse return .{
-                .is_cmd_exe = false,
-                .is_powershell_exe = false,
-            };
-
+        fn init(process_handle: windows.HANDLE) ShimPolicy {
             var is_cmd_exe = false;
             var is_powershell_exe = false;
+
             processPolicies.applyConsoleShimPolicy(
-                handle,
+                process_handle,
                 &is_cmd_exe,
                 &is_powershell_exe,
             );

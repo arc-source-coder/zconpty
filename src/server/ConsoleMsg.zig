@@ -264,6 +264,8 @@ pub const L3 = struct {
         SetCurrentConsoleFont: CONSOLE_CURRENTFONT_MSG,
         SetConsoleHistory: CONSOLE_HISTORY_MSG,
         GetConsoleHistory: CONSOLE_HISTORY_MSG,
+        WslzBootstrap: CONSOLE_WSLZ_BOOTSTRAP_MSG,
+        WslzSetInteropMode: CONSOLE_WSLZ_SET_INTEROP_MODE_MSG,
     };
 
     pub const CONSOLE_GETNUMBEROFFONTS_MSG = extern struct {
@@ -432,6 +434,24 @@ pub const L3 = struct {
         HistoryBufferSize: windows.ULONG,
         NumberOfHistoryBuffers: windows.ULONG,
         dwFlags: windows.ULONG,
+    };
+    /// Used by wslz.exe to start the WSL integration.
+    pub const CONSOLE_WSLZ_BOOTSTRAP_MSG = extern struct {
+        /// Token to authenticate WSLZ_SET_INTEROP_MODE calls
+        token: [16]u8,
+        /// Number of bytes written to portName
+        portNameLength: windows.USHORT,
+        /// The ALPC port to transfer handles through.
+        portName: [64]windows.WCHAR,
+    };
+    /// Used to wslz.exe to notify interop state changes.
+    pub const CONSOLE_WSLZ_SET_INTEROP_MODE_MSG = extern struct {
+        /// Token to authenticate the call
+        token: [16]u8,
+        /// Whether Windows interop mode is active.
+        /// This is used to switch input paths to ConDrv
+        /// instead of directly writing input to the WSL socket
+        windowsInterop: windows.BOOLEAN,
     };
 };
 

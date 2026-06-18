@@ -8,7 +8,7 @@ const input_types = @import("InputTypes.zig");
 const render = @import("CookedReadRender.zig");
 const session_state = @import("SessionState.zig");
 const terminal_mod = @import("Terminal.zig");
-const utf = @import("utf.zig");
+const utf = @import("../utf.zig");
 
 const InputMode = session_state.InputMode;
 const KeyEvent = input_types.KeyEvent;

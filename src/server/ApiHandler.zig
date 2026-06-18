@@ -8,8 +8,9 @@ const ioCompletion = @import("IoCompletion.zig");
 const Input = @import("Input.zig");
 const process = @import("Process.zig");
 const sessionState = @import("SessionState.zig");
-const utf = @import("utf.zig");
+const utf = @import("../utf.zig");
 const utils = @import("../utils.zig");
+const wsl = @import("../wsl/Wsl.zig");
 
 const ntSuccess = utils.ntSuccess;
 const ConDrvHandler = cdHandler.ConDrvHandler;
@@ -208,6 +209,91 @@ pub const ApiHandler = struct {
                 break :blk .complete;
             },
         };
+    }
+
+    pub fn handleWslzBootstrap(
+        self: *ApiHandler,
+        message: *CONSOLE_DATA_PACKET,
+        completion: *condrv.CD_IO_COMPLETE,
+    ) DispatchResult {
+        const bootstrap_message = &message.Body.api_msg.msgBody.consoleMsgL3.WslzBootstrap;
+        ioCompletion.setStatus(completion, .UNSUCCESSFUL);
+
+        // If a session already exists, fail the current request
+        if (self.state.wslz_session != null) return .complete;
+
+        // Verify the hash of the process
+        const entry: *process.Process = @ptrFromInt(message.Descriptor.Process);
+        const valid = wsl.verifyWslz(entry.process_handle);
+        if (!valid) return .complete;
+
+        const allocator = self.state.allocator;
+
+        var port_buf: [64]u8 = undefined;
+        const port_number = std.crypto.random.int(u128);
+
+        const pid = std.os.windows.GetCurrentProcessId();
+        const port_name_utf8 = std.fmt.bufPrint(
+            &port_buf,
+            "\\RPC Control\\zconpty-{d}-{x}",
+            .{ pid, port_number },
+        ) catch {
+            return .complete;
+        };
+
+        const port_name_utf16 = utf.utf8ToUtf16LeAlloc(allocator, port_name_utf8) catch {
+            return .complete;
+        };
+        defer allocator.free(port_name_utf16);
+        var token: [16]u8 = undefined;
+        std.crypto.random.bytes(&token);
+
+        const wslz_session = allocator.create(wsl.WslzSession) catch return .complete;
+        errdefer allocator.destroy(wslz_session);
+        wslz_session.init(
+            allocator,
+            &self.state.terminal,
+            message.Descriptor.Process,
+            token,
+            port_name_utf16,
+        ) catch {
+            return .complete;
+        };
+        self.state.wslz_session = wslz_session;
+
+        bootstrap_message.token = token;
+        bootstrap_message.portNameLength = @truncate(port_name_utf16.len);
+        bootstrap_message.portName = @splat(0);
+        @memcpy(bootstrap_message.portName[0..port_name_utf16.len], port_name_utf16);
+        self.input.target = .Wsl;
+
+        ioCompletion.setSuccess(completion);
+        return .complete;
+    }
+
+    pub fn handleWslzSetInteropMode(
+        self: *ApiHandler,
+        message: *CONSOLE_DATA_PACKET,
+        completion: *condrv.CD_IO_COMPLETE,
+    ) DispatchResult {
+        const interop_message = &message.Body.api_msg.msgBody.consoleMsgL3.WslzSetInteropMode;
+        ioCompletion.setStatus(completion, .UNSUCCESSFUL);
+
+        const wslz = self.state.wslz_session orelse return .complete;
+        if (!wslz.verifyToken(interop_message.token)) return .complete;
+
+        if (interop_message.windowsInterop == .FALSE) {
+            // Windows interop mode ended.
+            // Switch to WSL input path
+            self.input.target = .Wsl;
+        } else {
+            // Windows interop mode is active.
+            // Switch the input path to ConDrv
+            self.input.target = .Condrv;
+        }
+
+        ioCompletion.setSuccess(completion);
+        return .complete;
     }
 
     pub fn handleGetConsoleCP(

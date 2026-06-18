@@ -6,8 +6,6 @@
         "build.zig",
         "build.zig.zon",
         "src/",
-        "src/server/",
-        "src/utils.zig",
     },
     .dependencies = .{
         .uucode = .{

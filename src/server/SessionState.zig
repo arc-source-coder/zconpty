@@ -1,8 +1,9 @@
 const std = @import("std");
 const windows = @import("../windows.zig");
 const process = @import("Process.zig");
-const utf = @import("utf.zig");
+const utf = @import("../utf.zig");
 const utils = @import("../utils.zig");
+const wsl = @import("../wsl/Wsl.zig");
 
 pub const Terminal = @import("Terminal.zig");
 
@@ -230,6 +231,7 @@ pub const State = struct {
     processes: std.ArrayList(*Process),
     connected_process_count: std.atomic.Value(u32),
     console: ConsoleState,
+    wslz_session: ?*wsl.WslzSession = null,
 
     pub fn init(allocator: std.mem.Allocator, terminal: Terminal) State {
         return .{
@@ -251,8 +253,12 @@ pub const State = struct {
         self.processes.deinit(self.allocator);
         self.console.deinit(self.allocator);
         self.closing = false;
-        self.connected_process_count.store(0, .release);
+        self.connected_process_count.store(0, .monotonic);
         self.processes_mutex.unlock();
+        if (self.wslz_session) |session| {
+            session.deinit();
+            self.allocator.destroy(session);
+        }
         self.* = undefined;
     }
 
@@ -283,6 +289,7 @@ pub const State = struct {
 
     pub fn forceTerminateSnapshot(snapshot: *const ControlTargetSnapshot) void {
         for (snapshot.targets.items) |target| {
+            // TODO: Cleanup this up.
             const duplicated_handle = target.process_handle;
             const opened_handle = if (handleIsValid(duplicated_handle))
                 windows.INVALID_HANDLE_VALUE
@@ -317,7 +324,7 @@ pub const State = struct {
     }
 
     pub fn connectedProcessCount(self: *const State) u32 {
-        return self.connected_process_count.load(.acquire);
+        return self.connected_process_count.load(.monotonic);
     }
 
     pub fn isPowershellClient(self: *State, client_process: windows.ULONG_PTR) bool {
@@ -349,15 +356,13 @@ pub const State = struct {
         pid: windows.DWORD,
         tid: windows.DWORD,
         process_group_id: windows.ULONG,
-        process_handle: ?windows.HANDLE,
+        process_handle: windows.HANDLE,
     ) !*Process {
         self.processes_mutex.lock();
         defer self.processes_mutex.unlock();
 
         if (self.closing) {
-            if (process_handle) |handle| {
-                _ = windows.NtClose(handle);
-            }
+            _ = windows.NtClose(process_handle);
             return error.SessionClosing;
         }
 
@@ -370,38 +375,33 @@ pub const State = struct {
 
             // Keep the originally tracked process handle; close the
             // newly opened duplicate handle from this connect attempt.
-            if (process_handle) |handle| {
-                _ = windows.NtClose(handle);
-            }
+            _ = windows.NtClose(process_handle);
             return entry;
         }
 
         const process_entry = try self.allocator.create(Process);
         errdefer self.allocator.destroy(process_entry);
-        errdefer if (process_handle) |handle| {
-            _ = windows.NtClose(handle);
-        };
+        errdefer _ = windows.NtClose(process_handle);
 
         process_entry.* = Process.init(pid, tid, process_group_id, process_handle);
 
         try self.processes.append(self.allocator, process_entry);
-        self.connected_process_count.store(@intCast(self.processes.items.len), .release);
+        self.connected_process_count.store(@intCast(self.processes.items.len), .monotonic);
         return process_entry;
     }
 
-    pub fn unregisterProcessByClientPointer(self: *State, client_process: windows.ULONG_PTR) bool {
+    pub fn unregisterProcess(self: *State, client_process: *process.Process) void {
         self.processes_mutex.lock();
         defer self.processes_mutex.unlock();
 
         for (self.processes.items, 0..) |entry, index| {
-            if (client_process == @intFromPtr(entry)) {
-                removeProcessAt(self, index);
-                self.connected_process_count.store(@intCast(self.processes.items.len), .release);
+            if (entry == client_process) {
+                _ = self.processes.swapRemove(index);
+                self.connected_process_count.store(@intCast(self.processes.items.len), .monotonic);
                 self.destroyProcess(entry);
-                return true;
+                return;
             }
         }
-        return false;
     }
 
     pub fn createHandle(
@@ -432,21 +432,8 @@ pub const State = struct {
         if (process_entry.output_handle) |handle| {
             self.destroyHandle(handle);
         }
-        if (process_entry.process_handle) |handle| {
-            _ = windows.NtClose(handle);
-        }
+        _ = windows.NtClose(process_entry.process_handle);
         self.allocator.destroy(process_entry);
-    }
-
-    fn removeProcessAt(self: *State, index: usize) void {
-        const last_index = self.processes.items.len - 1;
-        if (index < last_index) {
-            @memmove(
-                self.processes.items[index..last_index],
-                self.processes.items[index + 1 .. self.processes.items.len],
-            );
-        }
-        self.processes.items.len -= 1;
     }
 
     fn snapshotControlTargetsLocked(
@@ -482,19 +469,21 @@ pub const State = struct {
     }
 
     fn duplicateTrackedProcessHandle(process_entry: *const Process) windows.HANDLE {
-        const source_handle = process_entry.process_handle orelse return windows.INVALID_HANDLE_VALUE;
+        const source_handle = process_entry.process_handle;
 
         var duplicate_handle: windows.HANDLE = windows.INVALID_HANDLE_VALUE;
         const current_process = windows.GetCurrentProcess();
-        if (windows.DuplicateHandle(
+
+        const status = windows.NtDuplicateObject(
             current_process,
             source_handle,
             current_process,
             &duplicate_handle,
             0,
-            .FALSE,
+            0,
             windows.DUPLICATE_SAME_ACCESS,
-        ) == .FALSE) {
+        );
+        if (!utils.ntSuccess(status)) {
             std.log.warn("failed to duplicate process handle for pid={d}", .{process_entry.pid});
             return windows.INVALID_HANDLE_VALUE;
         }

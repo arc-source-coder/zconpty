@@ -15,7 +15,7 @@ fn addUucodeImport(
     }
 }
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = blk: {
         var result = b.standardTargetOptions(.{});
         // Match shim defaults: use MSVC ABI on Windows unless explicitly overridden.
@@ -28,12 +28,49 @@ pub fn build(b: *std.Build) void {
     };
     const optimize = b.standardOptimizeOption(.{});
 
-    const module = b.addModule("zconpty", .{
+    const exe = b.addExecutable(.{
+        .name = "wslz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    b.installArtifact(exe);
+
+    const hash_tool = b.addExecutable(.{
+        .name = "wslz-hasher",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/hasher.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_hasher = b.addRunArtifact(hash_tool);
+
+    run_hasher.addFileArg(exe.getEmittedBin());
+    const hash_file = run_hasher.addOutputFileArg("wslz_hash.zig");
+
+    const zconpty_mod = b.addModule("zconpty", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    addUucodeImport(b, module, target, optimize);
+
+    addUucodeImport(b, zconpty_mod, target, optimize);
+
+    // Add the location of the generated hash
+    zconpty_mod.addAnonymousImport("wslz_hash", .{ .root_source_file = hash_file });
+
+    const lib = b.addLibrary(.{
+        .name = "zconpty",
+        .root_module = zconpty_mod,
+        .linkage = .static,
+        .use_llvm = true,
+    });
+
+    b.installArtifact(lib);
 
     const test_step = b.step("test", "Run unit tests");
     const lib_tests = b.addTest(.{
@@ -42,9 +79,15 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = b.option(
+            []const []const u8,
+            "test-filter",
+            "Filter for test. Only applies to Zig tests.",
+        ) orelse &[0][]const u8{},
     });
+
     addUucodeImport(b, lib_tests.root_module, target, optimize);
-    lib_tests.root_module.addImport("zconpty", module);
+    lib_tests.root_module.addImport("zconpty", lib.root_module);
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");

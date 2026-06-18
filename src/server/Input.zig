@@ -12,7 +12,7 @@ const input_types = @import("InputTypes.zig");
 const io_completion = @import("IoCompletion.zig");
 const session_state = @import("SessionState.zig");
 const terminal_mod = @import("Terminal.zig");
-const utf = @import("utf.zig");
+const utf = @import("../utf.zig");
 const utils = @import("../utils.zig");
 
 const ConDrvHandler = condrv_handler.ConDrvHandler;
@@ -35,6 +35,7 @@ pub const W3CCode = input_types.W3CCode;
 allocator: std.mem.Allocator,
 server_handle: windows.HANDLE,
 state: *State,
+target: Target,
 terminal: Terminal,
 input_mode: *std.atomic.Value(windows.ULONG),
 input_available_event: windows.HANDLE,
@@ -43,6 +44,8 @@ cooked_read_slot: CookedRead.Slot,
 cooked_history_pool: CookedRead.HistoryPool,
 input_buffer: InputBuffer,
 preferred_reader: std.atomic.Value(u8),
+
+pub const Target = enum { Condrv, Wsl };
 
 pub const BeginResult = union(enum) {
     completed,
@@ -155,6 +158,7 @@ const ReadyGetConsoleInput = enum {
 };
 
 const Route = enum {
+    wsl,
     pending_read,
     legacy_waiter,
     fallback_vt,
@@ -181,6 +185,7 @@ pub fn init(
         .allocator = allocator,
         .server_handle = server_handle,
         .state = state,
+        .target = .Condrv,
         .terminal = terminal,
         .input_mode = input_mode,
         .input_available_event = windows.INVALID_HANDLE_VALUE,
@@ -223,6 +228,11 @@ pub fn sendPaste(self: *Self, text: []const u8) void {
 }
 
 pub fn sendResize(self: *Self, cols: u16, rows: u16) void {
+    if (self.target == .Wsl) {
+        var wslz = self.state.wslz_session orelse return;
+        wslz.notifyResize(rows, cols);
+        return;
+    }
     self.redrawCookedIfActive();
 
     var record: windows.INPUT_RECORD = .{
@@ -733,6 +743,13 @@ fn handleKey(self: *Self, event: KeyEvent) void {
     if (self.tryHandleControlKey(resolved_event)) return;
 
     switch (delivery_route) {
+        .wsl => {
+            var buf: [128]u8 = undefined;
+            const written = self.terminal.vtEncodeKey(&resolved_event, buf[0..]);
+            if (written == 0) return;
+            var wslz = self.state.wslz_session orelse return;
+            wslz.writeInput(buf[0..written]);
+        },
         .pending_read, .fallback_vt => {
             var buf: [128]u8 = undefined;
             const written = self.terminal.vtEncodeKey(&resolved_event, buf[0..]);
@@ -774,6 +791,13 @@ fn handleMouse(self: *Self, event: MouseEvent) void {
     const delivery_route = self.route();
 
     switch (delivery_route) {
+        .wsl => {
+            var buf: [128]u8 = undefined;
+            const written = self.terminal.vtEncodeMouse(&event, buf[0..]);
+            if (written == 0) return;
+            var wslz = self.state.wslz_session orelse return;
+            wslz.writeInput(buf[0..written]);
+        },
         .pending_read, .fallback_vt => {
             var buf: [128]u8 = undefined;
             const written = self.terminal.vtEncodeMouse(&event, buf[0..]);
@@ -799,6 +823,14 @@ fn handleFocus(self: *Self, focused: bool) void {
     const delivery_route = self.route();
 
     switch (delivery_route) {
+        .wsl => {
+            var buf: [8]u8 = undefined;
+            const written = self.terminal.vtEncodeFocus(focused, buf[0..]);
+            if (written == 0) return;
+
+            var wslz = self.state.wslz_session orelse return;
+            wslz.writeInput(buf[0..written]);
+        },
         .pending_read, .fallback_vt => {
             var buf: [8]u8 = undefined;
             const written = self.terminal.vtEncodeFocus(focused, buf[0..]);
@@ -822,6 +854,16 @@ fn handlePaste(self: *Self, text: []const u8) void {
     const delivery_route = self.route();
 
     switch (delivery_route) {
+        .wsl => {
+            const max_len = text.len + 16;
+            const encoded = self.allocator.alloc(u8, max_len) catch return;
+            defer self.allocator.free(encoded);
+
+            const written = self.terminal.vtEncodePaste(encoded.ptr, text.ptr, text.len, max_len);
+            if (written == 0) return;
+            var wslz = self.state.wslz_session orelse return;
+            wslz.writeInput(encoded[0..written]);
+        },
         .pending_read, .fallback_vt => {
             const max_len = text.len + 16;
             const encoded = self.allocator.alloc(u8, max_len) catch return;
@@ -854,6 +896,10 @@ fn deliverBytes(self: *Self, bytes: []const u8) void {
     const delivery_route = self.route();
 
     switch (delivery_route) {
+        .wsl => {
+            var wslz = self.state.wslz_session orelse return;
+            wslz.writeInput(bytes);
+        },
         .pending_read, .fallback_vt => self.deliverVtBytes(bytes),
         .legacy_waiter, .fallback_legacy => {
             if (self.shouldWrapVtForLegacy(delivery_route)) {
@@ -866,6 +912,7 @@ fn deliverBytes(self: *Self, bytes: []const u8) void {
 }
 
 fn route(self: *Self) Route {
+    if (self.target == .Wsl) return .wsl;
     self.vt_input_slot.mutex.lock();
     const has_pending_read = self.vt_input_slot.pending_read != null;
     self.vt_input_slot.mutex.unlock();
@@ -1496,7 +1543,7 @@ fn shouldWrapVtForLegacy(self: *const Self, delivery_route: Route) bool {
     return switch (delivery_route) {
         .legacy_waiter => true,
         .fallback_legacy => self.preferredReader() == .legacy,
-        .pending_read, .fallback_vt => false,
+        .pending_read, .fallback_vt, .wsl => false,
     };
 }
 
@@ -1704,6 +1751,7 @@ fn rawReadReadyLocked(self: *const Self) bool {
 }
 
 fn tryHandleControlKey(self: *Self, event: KeyEvent) bool {
+    if (self.target == .Wsl) return false;
     if (!self.processedInputModeEnabled()) return false;
     if (event.action != .press) return false;
 

@@ -1,5 +1,8 @@
 # AGENTS.md
 
+Check `./CONTEXT.md` for terminology questions.
+`docs/wslz-design.md` documents the architecture of the wslz subsystem.
+
 ## Build & Commands
 
 - Build and test with: `zig build test`
@@ -10,6 +13,7 @@
 Use `zigdoc` to discover current APIs for the Zig standard library and any third-party dependencies before coding.
 
 Examples:
+
 ```bash
 zigdoc std.fs
 zigdoc std.posix.getuid
@@ -22,6 +26,7 @@ After zig work, run `zig fmt` and `ziglint` on the changed files.
 ## Current Zig Patterns
 
 **ArrayList:**
+
 ```zig
 var list: std.ArrayList(u32) = .empty;
 defer list.deinit(allocator);
@@ -29,6 +34,7 @@ try list.append(allocator, 42);
 ```
 
 **HashMap/StringHashMap (default to unmanaged):**
+
 ```zig
 var map: std.StringHashMapUnmanaged(u32) = .empty;
 defer map.deinit(allocator);
@@ -36,6 +42,7 @@ try map.put(allocator, "key", 42);
 ```
 
 **stdout/stderr writer:**
+
 ```zig
 var buf: [4096]u8 = undefined;
 var writer = std.fs.File.stdout().writer(&buf);
@@ -44,6 +51,7 @@ try writer.interface.print("hello {s}\n", .{"world"});
 ```
 
 **build.zig executable:**
+
 ```zig
 b.addExecutable(.{
     .name = "foo",
@@ -58,9 +66,11 @@ b.addExecutable(.{
 **Calling Convention**
 
 Zig 0.15.2 uses `callconv(.c)`, not `callconv(.C)` (Note the lowercase .c)
+
 - The calling convention for Windows APIs is `callconv(.winapi)`.
 
 **JSON writing:**
+
 ```zig
 var buf: [4096]u8 = undefined;
 var writer = std.fs.File.stdout().writer(&buf);
@@ -74,6 +84,7 @@ try jw.write(my_struct);
 ```
 
 **Allocating writer:**
+
 ```zig
 var writer: std.Io.Writer.Allocating = .init(allocator);
 defer writer.deinit();
@@ -96,5 +107,5 @@ const output = try writer.toOwnedSlice();
 
 - Add assertions at API boundaries and state transitions; avoid trivial assertions.
 - Keep functions small and push pure computation into helpers.
-- Prefer self-documenting code. Comments should explain why, not what. 
+- Prefer self-documenting code. Comments should explain why, not what.
 - Add detailed comments for anything that needs explanation.

@@ -10,11 +10,12 @@ const ioCompletion = @import("IoCompletion.zig");
 const input_mod = @import("Input.zig");
 const logger = @import("logger.zig");
 const sessionState = @import("SessionState.zig");
-const utf = @import("utf.zig");
+const utf = @import("../utf.zig");
 const utils = @import("../utils.zig");
 
 const ntSuccess = utils.ntSuccess;
 const handleIsValid = utils.handleIsValid;
+const ProcThreadAttributes = utils.ProcThreadAttributes;
 const ConDrvHandler = cdHandler.ConDrvHandler;
 
 // OpenConsole lets the hosting terminal return immediately because the console
@@ -237,37 +238,26 @@ fn launchChildWithConsoleReference(session: *Session) windows.HRESULT {
     var stdin_handle: windows.HANDLE = windows.INVALID_HANDLE_VALUE;
     var stdout_handle: windows.HANDLE = windows.INVALID_HANDLE_VALUE;
     var stderr_handle: windows.HANDLE = windows.INVALID_HANDLE_VALUE;
-    errdefer {
-        if (handleIsValid(stderr_handle)) _ = windows.NtClose(stderr_handle);
-        if (handleIsValid(stdout_handle)) _ = windows.NtClose(stdout_handle);
-        if (handleIsValid(stdin_handle)) _ = windows.NtClose(stdin_handle);
-        if (handleIsValid(reference_handle)) _ = windows.NtClose(reference_handle);
-    }
 
     const reference_name = utf.utf8ToUtf16LeStringLiteral("\\Reference");
     var status = createClientHandle(&reference_handle, session.server_handle, reference_name, .FALSE);
     if (!ntSuccess(status)) return utils.hresultFromNt(status);
+    defer _ = windows.NtClose(reference_handle);
 
     const stdin_name = utf.utf8ToUtf16LeStringLiteral("\\Input");
     status = createClientHandle(&stdin_handle, session.server_handle, stdin_name, .TRUE);
     if (!ntSuccess(status)) return utils.hresultFromNt(status);
+    defer _ = windows.NtClose(stdin_handle);
 
     const stdout_name = utf.utf8ToUtf16LeStringLiteral("\\Output");
     status = createClientHandle(&stdout_handle, session.server_handle, stdout_name, .TRUE);
     if (!ntSuccess(status)) return utils.hresultFromNt(status);
+    defer _ = windows.NtClose(stdout_handle);
 
-    const current_process = windows.GetCurrentProcess();
-    if (windows.DuplicateHandle(
-        current_process,
-        stdout_handle,
-        current_process,
-        &stderr_handle,
-        0,
-        .TRUE,
-        windows.DUPLICATE_SAME_ACCESS,
-    ) == .FALSE) {
-        return utils.hresultFromWin32(windows.GetLastError());
-    }
+    stderr_handle = utils.duplicateHandle(stdout_handle, windows.OBJ_INHERIT) catch |err| {
+        return utils.hresultFromNt(utils.mapError(err));
+    };
+    defer _ = windows.NtClose(stderr_handle);
 
     var startup_info: windows.STARTUPINFOEXW = .{
         .StartupInfo = std.mem.zeroes(windows.STARTUPINFOW),
@@ -279,55 +269,56 @@ fn launchChildWithConsoleReference(session: *Session) windows.HRESULT {
     startup_info.StartupInfo.hStdOutput = stdout_handle;
     startup_info.StartupInfo.hStdError = stderr_handle;
 
-    var attr_list_size: windows.SIZE_T = 0;
-    _ = windows.InitializeProcThreadAttributeList(null, 2, 0, &attr_list_size);
+    var attributes = ProcThreadAttributes.init(session.allocator, 2) catch |err| {
+        return utils.hresultFromNt(utils.mapError(err));
+    };
+    defer attributes.deinit();
+    startup_info.lpAttributeList = attributes.list;
 
-    const attr_list_mem = session.allocator.alloc(u8, attr_list_size) catch return windows.E_OUTOFMEMORY;
-    defer session.allocator.free(attr_list_mem);
-
-    startup_info.lpAttributeList = @ptrCast(attr_list_mem.ptr);
-    if (windows.InitializeProcThreadAttributeList(startup_info.lpAttributeList, 2, 0, &attr_list_size) == .FALSE) {
-        return utils.hresultFromWin32(windows.GetLastError());
-    }
-    defer windows.DeleteProcThreadAttributeList(startup_info.lpAttributeList);
-
-    if (windows.UpdateProcThreadAttribute(
-        startup_info.lpAttributeList,
-        0,
+    attributes.update(
         windows.PROC_THREAD_ATTRIBUTE_CONSOLE_REFERENCE,
         @ptrCast(&reference_handle),
         @sizeOf(windows.HANDLE),
-        null,
-        null,
-    ) == .FALSE) {
-        return utils.hresultFromWin32(windows.GetLastError());
-    }
+    ) catch |err| return utils.hresultFromNt(utils.mapError(err));
 
     var inherited_handle_list: [3]windows.HANDLE = .{
         stdin_handle,
         stdout_handle,
         stderr_handle,
     };
-    if (windows.UpdateProcThreadAttribute(
-        startup_info.lpAttributeList,
-        0,
+
+    attributes.update(
         windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         @ptrCast(&inherited_handle_list),
         @sizeOf(@TypeOf(inherited_handle_list)),
-        null,
-        null,
-    ) == .FALSE) {
-        return utils.hresultFromWin32(windows.GetLastError());
-    }
+    ) catch |err| return utils.hresultFromNt(utils.mapError(err));
 
-    const shell = utf.utf8ToUtf16LeAllocZ(session.allocator, "powershell.exe") catch return windows.E_OUTOFMEMORY;
+    const shell = if (false) blk: {
+        // This condition will be replaced by an Options parameter passed in by the host.
+        const path = std.fs.selfExeDirPathAlloc(session.allocator) catch return windows.E_FAIL;
+        defer session.allocator.free(path);
+
+        const wslz = std.fmt.allocPrint(session.allocator, "{s}\\wslz.exe", .{path}) catch {
+            return windows.E_OUTOFMEMORY;
+        };
+        defer session.allocator.free(wslz);
+
+        const wslz_path = std.fs.realpathAlloc(session.allocator, wslz) catch return windows.E_FAIL;
+        defer session.allocator.free(wslz_path);
+
+        break :blk utf.utf8ToUtf16LeAllocZ(session.allocator, wslz_path) catch {
+            return windows.E_OUTOFMEMORY;
+        };
+    } else utf.utf8ToUtf16LeAllocZ(session.allocator, "powershell.exe") catch {
+        return windows.E_OUTOFMEMORY;
+    };
     defer session.allocator.free(shell);
 
     const creation_flags: windows.DWORD = @bitCast(windows.CreateProcessFlags{
         .extended_startupinfo_present = true,
     });
 
-    var process_info: windows.PROCESS_INFORMATION = undefined;
+    var process_info: windows.PROCESS.INFORMATION = undefined;
     if (windows.CreateProcessW(
         null,
         shell.ptr,
@@ -345,11 +336,6 @@ fn launchChildWithConsoleReference(session: *Session) windows.HRESULT {
 
     _ = windows.NtClose(process_info.hThread);
     _ = windows.NtClose(process_info.hProcess);
-
-    _ = windows.NtClose(reference_handle);
-    _ = windows.NtClose(stdin_handle);
-    _ = windows.NtClose(stdout_handle);
-    _ = windows.NtClose(stderr_handle);
 
     return windows.S_OK;
 }

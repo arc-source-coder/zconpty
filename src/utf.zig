@@ -1,5 +1,5 @@
 const std = @import("std");
-const windows = @import("../windows.zig");
+const windows = @import("windows.zig");
 
 const CP_UTF8: windows.UINT = 65001;
 const CP_US_ASCII: windows.UINT = 20127;
@@ -24,24 +24,19 @@ pub inline fn utf8ToUtf16LeStringLiteral(comptime text: []const u8) [*:0]const w
     return std.unicode.utf8ToUtf16LeStringLiteral(text);
 }
 
-pub inline fn utf8ToUtf16LeAllocZ(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-) ![:0]u16 {
+pub inline fn utf8ToUtf16LeAllocZ(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
     return std.unicode.utf8ToUtf16LeAllocZ(allocator, text);
 }
 
-pub inline fn utf16LeToUtf8Alloc(
-    allocator: std.mem.Allocator,
-    text: []const u16,
-) ![]u8 {
+pub inline fn utf8ToUtf16LeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u16 {
+    return std.unicode.utf8ToUtf16LeAlloc(allocator, text);
+}
+
+pub inline fn utf16LeToUtf8Alloc(allocator: std.mem.Allocator, text: []const u16) ![]u8 {
     return std.unicode.utf16LeToUtf8Alloc(allocator, text);
 }
 
-pub fn utf8ToUtf16BytesAlloc(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-) ![]u8 {
+pub fn utf8ToUtf16BytesAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const utf16 = try utf8ToUtf16LeAllocZ(allocator, text);
     defer allocator.free(utf16);
 
@@ -52,10 +47,7 @@ pub fn encodeCodepointUtf8(codepoint: u21, out: []u8) !u3 {
     return std.unicode.utf8Encode(codepoint, out);
 }
 
-pub fn utf16BytesToUtf8Alloc(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-) error{ OutOfMemory, InvalidParameter, InvalidUtf16 }![]u8 {
+pub fn utf16BytesToUtf8Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     if ((bytes.len & 1) != 0) return error.InvalidParameter;
 
     const code_units = bytes.len / @sizeOf(u16);

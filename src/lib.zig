@@ -28,5 +28,11 @@ test {
     _ = @import("server/Server.zig");
     _ = @import("server/SessionState.zig");
     _ = @import("server/Terminal.zig");
-    _ = @import("server/utf.zig");
+    _ = @import("utf.zig");
+    _ = @import("wsl/Alpc.zig");
+    _ = @import("wsl/Cli.zig");
+    _ = @import("wsl/Environment.zig");
+    _ = @import("wsl/Wsl.zig");
+    _ = @import("wsl/Interop.zig");
+    _ = @import("wsl/Io.zig");
 }

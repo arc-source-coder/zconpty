@@ -569,7 +569,7 @@ pub extern "ntdll" fn NtMapViewOfSection(
     SectionHandle: HANDLE,
     ProcessHandle: HANDLE,
     BaseAddress: ?*PVOID,
-    ZeroBits: ?*const ULONG,
+    ZeroBits: ULONG_PTR,
     CommitSize: SIZE_T,
     SectionOffset: ?*LARGE_INTEGER,
     ViewSize: *SIZE_T,
